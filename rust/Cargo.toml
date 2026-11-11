@@ -10,8 +10,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # HTTP client with browser impersonation
-wreq = { version = "0.16.3", default-features = false, features = ["cookies", "gzip", "brotli", "deflate", "zstd", "charset", "system-proxy", "socks", "ws", "stream", "webpki-roots", "tokio-rt"] }
-wreq-util = { version = "0.2.0", features = ["emulation-serde", "tokio-rt", "emulation-compression"] }
+wreq = { version = "0.16.1", default-features = false, features = ["cookies", "gzip", "brotli", "deflate", "zstd", "charset", "system-proxy", "socks", "ws", "stream", "webpki-roots", "tokio-rt"] }
+wreq-util = { version = "0.2.0", features = ["emulation-serde", "tokio-rt", "emulation-compression", "emulation-chromium-pki"] }
 webpki-root-certs = "1.0.11"
 
 # WebSocket support
@@ -47,7 +47,7 @@ uuid = { version = "1.29.0", features = ["v4"] }
 [build-dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-wreq-util = { version = "0.2.0", features = ["emulation-serde", "tokio-rt", "emulation-compression"] }
+wreq-util = { version = "0.2.0", features = ["emulation-serde", "tokio-rt", "emulation-compression", "emulation-chromium-pki"] }
 
 [dev-dependencies]
 btls = "0.5.6"
@@ -57,3 +57,11 @@ opt-level = 3
 lto = true
 codegen-units = 1
 debug = false
+
+# podfarm: Chrome 156's ClientHello (server_padding 0x12e0, Trust Anchor IDs, ML-DSA), from the
+# forks' `podfarm` branches; wreq and btls at the revisions wreq-util's own main pins.
+[patch.crates-io]
+wreq = { git = "https://github.com/sirhappy/wreq", rev = "f715083dace0b42267176c03d8e174b9b4cdede2" }
+wreq-util = { git = "https://github.com/sirhappy/wreq-util", rev = "a2fedda381320902633c2386ca981977a71e148a" }
+btls = { git = "https://github.com/0x676e67/btls", rev = "129887582a538b8f4dcf371d15c953335312ca37" }
+btls-sys = { git = "https://github.com/0x676e67/btls", rev = "129887582a538b8f4dcf371d15c953335312ca37" }

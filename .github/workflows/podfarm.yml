@@ -1,0 +1,153 @@
+# podfarm's build: the three bindings its render machines load (macOS arm64 and x64, Windows x64),
+# then one tarball (dist + rust/*.node, no install scripts, no optional deps) on a GitHub Release.
+# Run by hand with the release tag to create, e.g. v3.2.0-podfarm.1.
+name: podfarm build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (v<package.json version>)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - { host: macos-14, target: aarch64-apple-darwin, arch: arm64 }
+          - { host: macos-15-intel, target: x86_64-apple-darwin, arch: x64 }
+          - { host: windows-2022, target: x86_64-pc-windows-msvc, arch: x64, generator: "Visual Studio 17 2022" }
+    name: Build - ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.host }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          architecture: ${{ matrix.settings.arch }}
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y }
+          ninja --version
+
+      - name: Setup NASM (Windows x64)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Patch btls-sys on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd rust
+          cargo fetch
+          # btls-sys comes from git (Cargo.toml [patch]), so its build script is under git/checkouts.
+          FILE=$(find ~/.cargo/registry/src ~/.cargo/git/checkouts -path "*btls-sys*" -name "main.rs" 2>/dev/null | grep "/build/" | head -1)
+          if [ -z "$FILE" ]; then echo "Error: btls-sys build/main.rs not found"; exit 1; fi
+          echo "Patching $FILE"
+          patch_and_verify() {
+            sed -i "$1" "$FILE"
+            if ! grep -q -F -- "$2" "$FILE"; then echo "Error: patch did not apply: $2"; exit 1; fi
+          }
+          patch_and_verify \
+            's/let bssl_dir = build_boringssl_or_get_prebuilt(config);/let bssl_dir = build_boringssl_or_get_prebuilt(config); if config.target.ends_with("-msvc") { println!("cargo:rustc-link-search=native={}\/lib", bssl_dir.display()); }/' \
+            'build_boringssl_or_get_prebuilt(config); if config.target.ends_with("-msvc")'
+          patch_and_verify \
+            's/cfg.build_target("ssl").build();/\/\/ cfg.build_target("ssl").build();/' \
+            '// cfg.build_target'
+          patch_and_verify \
+            's/cfg.build_target("crypto").build()/cfg.build_target("ALL_BUILD").build()/' \
+            'cfg.build_target("ALL_BUILD").build()'
+
+      - name: Build native module (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CMAKE_GENERATOR: ${{ matrix.settings.generator }}
+          CARGO_BUILD_TARGET: ${{ matrix.settings.target }}
+          CARGO_TARGET_DIR: rust/target
+        run: npm run build:rust -- --target ${{ matrix.settings.target }}
+
+      - name: Build native module (macOS)
+        if: runner.os == 'macOS'
+        run: npm run build:rust -- --target ${{ matrix.settings.target }}
+
+      - name: Smoke test native addon
+        env:
+          WREQ_TARGET: ${{ matrix.settings.target }}
+        run: node scripts/smoke-native.cjs
+
+      - name: Chrome 156 is in the profiles
+        shell: bash
+        run: |
+          node -e "const t={'aarch64-apple-darwin':'darwin-arm64','x86_64-apple-darwin':'darwin-x64','x86_64-pc-windows-msvc':'win32-x64-msvc'}['${{ matrix.settings.target }}'];const b=require('./rust/wreq-js.'+t+'.node');const p=b.getProfiles();if(!p.includes('chrome_156'))throw new Error('no chrome_156');console.log(p.filter(x=>/chrome_15/.test(x)).join(','))"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: rust/*.node
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build TypeScript
+        run: npm run build:ts
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          [ "v$VERSION" = "${{ inputs.tag }}" ] || { echo "tag ${{ inputs.tag }} is not v$VERSION"; exit 1; }
+          rm -rf pack && mkdir -p pack/package/rust
+          cp -R dist pack/package/
+          cp LICENSE README.md pack/package/
+          find artifacts -name '*.node' -exec cp {} pack/package/rust/ \;
+          ls -la pack/package/rust
+          [ "$(ls pack/package/rust/*.node | wc -l)" = 3 ] || { echo "expected 3 bindings"; exit 1; }
+          node -e "
+            const p=require('./package.json');
+            const out={name:p.name,version:p.version,description:p.description,license:p.license,type:p.type,main:p.main,types:p.types,exports:p.exports,engines:p.engines,files:['dist','rust/*.node']};
+            require('fs').writeFileSync('pack/package/package.json', JSON.stringify(out,null,2)+'\n');"
+          (cd pack/package && npm pack --pack-destination ..)
+          cd pack && sha256sum *.tgz | tee SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" pack/*.tgz pack/SHA256SUMS \
+            --target "${{ github.sha }}" --title "${{ inputs.tag }}" \
+            --notes "podfarm build: wreq-js with Chrome 156 (sirhappy/wreq + sirhappy/wreq-util, branch podfarm). Bindings: darwin-arm64, darwin-x64, win32-x64-msvc."
