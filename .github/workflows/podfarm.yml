@@ -1,4 +1,4 @@
-# podfarm's build: the three bindings its render machines load (macOS arm64 and x64, Windows x64),
+# podfarm's build: the bindings its render machines load (macOS arm64 and x64, Windows x64) and its CI (Linux x64),
 # then one tarball (dist + rust/*.node, no install scripts, no optional deps) on a GitHub Release.
 # Run by hand with the release tag to create, e.g. v3.2.0-podfarm.1.
 name: podfarm build
@@ -22,6 +22,8 @@ jobs:
           - { host: macos-15, target: aarch64-apple-darwin, arch: arm64 }
           - { host: macos-15-intel, target: x86_64-apple-darwin, arch: x64 }
           - { host: windows-2022, target: x86_64-pc-windows-msvc, arch: x64, generator: "Visual Studio 17 2022" }
+          # podfarm's CI runners (the agent's tests), not a render box.
+          - { host: ubuntu-24.04, target: x86_64-unknown-linux-gnu, arch: x64 }
     name: Build - ${{ matrix.settings.target }}
     runs-on: ${{ matrix.settings.host }}
     steps:
@@ -88,6 +90,23 @@ jobs:
         if: runner.os == 'macOS'
         run: npm run build:rust -- --target ${{ matrix.settings.target }}
 
+      - name: Build native module (x86_64-gnu, manylinux_2_28)
+        # As upstream: a manylinux_2_28 container pins glibc 2.28, so the addon loads on older runners too.
+        if: matrix.settings.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          docker run --rm -v "$PWD:/app" -w /app quay.io/pypa/manylinux_2_28_x86_64 sh -lc '
+            set -eux
+            dnf install -y --disablerepo=epel git make clang-devel
+            export LIBCLANG_PATH=/usr/lib64
+            curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+            . "$HOME/.cargo/env"
+            rustup target add x86_64-unknown-linux-gnu
+            curl -fsSL https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz | tar -xJ -C /usr/local --strip-components=1
+            npm ci --ignore-scripts
+            npm run build:rust -- --target x86_64-unknown-linux-gnu
+          '
+          sudo chown -R "$(id -u):$(id -g)" rust
+
       - name: Smoke test native addon
         env:
           WREQ_TARGET: ${{ matrix.settings.target }}
@@ -96,7 +115,7 @@ jobs:
       - name: Chrome 156 is in the profiles
         shell: bash
         run: |
-          node -e "const t={'aarch64-apple-darwin':'darwin-arm64','x86_64-apple-darwin':'darwin-x64','x86_64-pc-windows-msvc':'win32-x64-msvc'}['${{ matrix.settings.target }}'];const b=require('./rust/wreq-js.'+t+'.node');const p=b.getProfiles();if(!p.includes('chrome_156'))throw new Error('no chrome_156');console.log(p.filter(x=>/chrome_15/.test(x)).join(','))"
+          node -e "const t={'aarch64-apple-darwin':'darwin-arm64','x86_64-apple-darwin':'darwin-x64','x86_64-pc-windows-msvc':'win32-x64-msvc','x86_64-unknown-linux-gnu':'linux-x64-gnu'}['${{ matrix.settings.target }}'];const b=require('./rust/wreq-js.'+t+'.node');const p=b.getProfiles();if(!p.includes('chrome_156'))throw new Error('no chrome_156');console.log(p.filter(x=>/chrome_15/.test(x)).join(','))"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -136,7 +155,7 @@ jobs:
           cp LICENSE README.md pack/package/
           find artifacts -name '*.node' -exec cp {} pack/package/rust/ \;
           ls -la pack/package/rust
-          [ "$(ls pack/package/rust/*.node | wc -l)" = 3 ] || { echo "expected 3 bindings"; exit 1; }
+          [ "$(ls pack/package/rust/*.node | wc -l)" = 4 ] || { echo "expected 4 bindings"; exit 1; }
           node -e "
             const p=require('./package.json');
             const out={name:p.name,version:p.version,description:p.description,license:p.license,type:p.type,main:p.main,types:p.types,exports:p.exports,engines:p.engines,files:['dist','rust/*.node']};
@@ -150,4 +169,4 @@ jobs:
         run: |
           gh release create "${{ inputs.tag }}" pack/*.tgz pack/SHA256SUMS \
             --target "${{ github.sha }}" --title "${{ inputs.tag }}" \
-            --notes "podfarm build: wreq-js with Chrome 156 (sirhappy/wreq + sirhappy/wreq-util, branch podfarm). Bindings: darwin-arm64, darwin-x64, win32-x64-msvc."
+            --notes "podfarm build: wreq-js with Chrome 156 (sirhappy/wreq + sirhappy/wreq-util, branch podfarm). Bindings: darwin-arm64, darwin-x64, win32-x64-msvc, linux-x64-gnu (CI)."
